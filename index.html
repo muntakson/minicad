@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MiniCAD</title>
+  <style>
+    /* === AutoCAD R14 color palette === */
+    :root {
+      --bg-dark: #808080;      /* R14 gray toolbar background */
+      --bg-darker: #c0c0c0;   /* R14 lighter gray for panels */
+      --bg-toolbar: #c0c0c0;
+      --bg-cmd: #000000;       /* Command line: black */
+      --text-cmd: #cccccc;     /* Command text: light gray */
+      --text-prompt: #ffffff;  /* Active prompt: white */
+      --border: #404040;
+      --btn-face: #c0c0c0;
+      --btn-highlight: #ffffff;
+      --btn-shadow: #808080;
+      --status-bg: #c0c0c0;
+      --status-active: #000080;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      font-family: "MS Sans Serif", "Segoe UI", Tahoma, sans-serif;
+      font-size: 11px;
+      background: var(--bg-dark);
+    }
+
+    /* === LAYOUT: classic R14 arrangement === */
+    #app {
+      display: flex; flex-direction: column;
+      width: 100%; height: 100%;
+    }
+
+    /* --- Menu bar --- */
+    #menubar {
+      background: var(--bg-toolbar);
+      border-bottom: 1px solid var(--border);
+      padding: 1px 4px;
+      display: flex; align-items: center; gap: 2px;
+      height: 20px; flex-shrink: 0;
+    }
+    #menubar span {
+      padding: 1px 8px;
+      cursor: default;
+      color: #000;
+    }
+    #menubar span:hover { background: var(--status-active); color: #fff; }
+
+    /* --- Toolbar (R14 3D-raised buttons) --- */
+    #toolbar {
+      background: var(--bg-toolbar);
+      border-bottom: 1px solid var(--border);
+      padding: 2px 4px;
+      display: flex; align-items: center; gap: 1px;
+      height: 28px; flex-shrink: 0;
+    }
+    .tb-btn {
+      width: 24px; height: 24px;
+      background: var(--btn-face);
+      border-top: 1px solid var(--btn-highlight);
+      border-left: 1px solid var(--btn-highlight);
+      border-bottom: 1px solid var(--btn-shadow);
+      border-right: 1px solid var(--btn-shadow);
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer;
+      font-size: 10px; font-weight: bold; color: #000;
+    }
+    .tb-btn:active {
+      border-top: 1px solid var(--btn-shadow);
+      border-left: 1px solid var(--btn-shadow);
+      border-bottom: 1px solid var(--btn-highlight);
+      border-right: 1px solid var(--btn-highlight);
+    }
+    .tb-sep { width: 6px; }
+
+    /* --- Main area (canvas) --- */
+    #canvas-area {
+      flex: 1; position: relative; overflow: hidden;
+      background: #000;
+    }
+    #cad-canvas {
+      width: 100%; height: 100%;
+      display: block;
+    }
+
+    /* --- Command line (R14: black with monospace, 4 lines visible) --- */
+    #cmdline-area {
+      background: var(--bg-cmd);
+      border-top: 2px solid var(--border);
+      height: 72px; flex-shrink: 0;
+      display: flex; flex-direction: column;
+      font-family: "Fixedsys", "Courier New", monospace;
+      font-size: 13px;
+    }
+    #cmd-history {
+      flex: 1; overflow-y: auto; overflow-x: hidden;
+      padding: 2px 6px;
+      color: var(--text-cmd);
+      line-height: 1.3;
+    }
+    #cmd-history div { white-space: pre-wrap; }
+    #cmd-prompt-line {
+      display: flex; align-items: center;
+      border-top: 1px solid #333;
+      padding: 2px 6px;
+      background: #000;
+    }
+    #cmd-prompt-label {
+      color: var(--text-prompt);
+      margin-right: 4px;
+      white-space: nowrap;
+    }
+    #cmd-input {
+      flex: 1;
+      background: transparent; border: none; outline: none;
+      color: var(--text-prompt);
+      font-family: inherit; font-size: inherit;
+      caret-color: #fff;
+    }
+    #cmd-input::placeholder { color: #888; }
+
+    /* --- Status bar (R14 style with toggles) --- */
+    #statusbar {
+      background: var(--status-bg);
+      border-top: 1px solid var(--border);
+      height: 20px; flex-shrink: 0;
+      display: flex; align-items: center;
+      padding: 0 6px;
+      gap: 4px;
+      font-size: 10px;
+    }
+    #coord-display {
+      font-family: "Courier New", monospace;
+      color: #000;
+      min-width: 200px;
+    }
+    .status-toggle {
+      padding: 0 6px;
+      cursor: pointer;
+      border: 1px inset var(--btn-face);
+      background: var(--btn-face);
+      color: #808080;
+      font-weight: bold;
+      font-size: 10px;
+      user-select: none;
+    }
+    .status-toggle.active {
+      color: #000;
+      border-style: inset;
+      background: #e0e0e0;
+    }
+    .status-sep { flex: 1; }
+
+    /* --- Dropdown menus --- */
+    #menubar { position: relative; }
+    #menubar span { position: relative; }
+    #menubar span.menu-open { background: var(--status-active); color: #fff; }
+
+    .menu-dropdown {
+      display: none;
+      position: absolute;
+      top: 100%;
+      left: 0;
+      background: var(--btn-face);
+      border: 2px outset var(--btn-face);
+      min-width: 180px;
+      z-index: 1000;
+      padding: 2px 0;
+      box-shadow: 2px 2px 4px rgba(0,0,0,0.4);
+    }
+    .menu-dropdown.open { display: block; }
+    .menu-item {
+      padding: 3px 24px 3px 8px;
+      cursor: default;
+      color: #000;
+      white-space: nowrap;
+      font-size: 11px;
+    }
+    .menu-item:hover { background: var(--status-active); color: #fff; }
+    .menu-item.disabled { color: #808080; }
+    .menu-item.disabled:hover { background: transparent; color: #808080; }
+    .menu-sep { height: 1px; background: #808080; margin: 2px 4px; }
+    .menu-shortcut { float: right; color: #808080; margin-left: 20px; }
+    .menu-item:hover .menu-shortcut { color: #ddd; }
+
+    /* --- Context menu --- */
+    #context-menu {
+      display: none;
+      position: fixed;
+      background: var(--btn-face);
+      border: 2px outset var(--btn-face);
+      min-width: 160px;
+      z-index: 2000;
+      padding: 2px 0;
+      box-shadow: 2px 2px 4px rgba(0,0,0,0.4);
+    }
+    #context-menu.open { display: block; }
+    #context-menu .menu-item { padding: 3px 16px 3px 8px; }
+
+    /* Scrollbar styling for command history */
+    #cmd-history::-webkit-scrollbar { width: 8px; }
+    #cmd-history::-webkit-scrollbar-track { background: #000; }
+    #cmd-history::-webkit-scrollbar-thumb { background: #444; }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <!-- Menu bar -->
+    <div id="menubar">
+      <span data-menu="file">File
+        <div class="menu-dropdown" id="menu-file">
+          <div class="menu-item" data-action="new">New</div>
+          <div class="menu-item" data-action="open">Open DXF...</div>
+          <div class="menu-item" data-action="save">Save DXF...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-action="exit">Exit</div>
+        </div>
+      </span>
+      <span data-menu="edit">Edit
+        <div class="menu-dropdown" id="menu-edit">
+          <div class="menu-item" data-cmd="UNDO">Undo<span class="menu-shortcut">Ctrl+Z</span></div>
+          <div class="menu-item" data-cmd="REDO">Redo<span class="menu-shortcut">Ctrl+Y</span></div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-action="selectall">Select All</div>
+          <div class="menu-item" data-action="deselectall">Deselect All</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="ERASE">Erase</div>
+          <div class="menu-item" data-cmd="COPY">Copy</div>
+          <div class="menu-item" data-cmd="MOVE">Move</div>
+        </div>
+      </span>
+      <span data-menu="view">View
+        <div class="menu-dropdown" id="menu-view">
+          <div class="menu-item" data-cmd="ZOOM">Zoom</div>
+          <div class="menu-item" data-action="zoomall">Zoom All</div>
+          <div class="menu-item" data-cmd="PAN">Pan</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-action="f7">Grid<span class="menu-shortcut">F7</span></div>
+          <div class="menu-item" data-action="f8">Ortho<span class="menu-shortcut">F8</span></div>
+          <div class="menu-item" data-action="f9">Snap<span class="menu-shortcut">F9</span></div>
+          <div class="menu-item" data-action="f3">Object Snap<span class="menu-shortcut">F3</span></div>
+        </div>
+      </span>
+      <span data-menu="insert">Insert
+        <div class="menu-dropdown" id="menu-insert">
+          <div class="menu-item" data-cmd="BLOCK">Block...</div>
+          <div class="menu-item" data-cmd="INSERT">Insert Block...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="HATCH">Hatch...</div>
+        </div>
+      </span>
+      <span data-menu="format">Format
+        <div class="menu-dropdown" id="menu-format">
+          <div class="menu-item" data-cmd="LAYER">Layer...</div>
+          <div class="menu-item" data-cmd="LINETYPE">Linetype...</div>
+          <div class="menu-item" data-cmd="LINEWEIGHT">Lineweight...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="DIMSTYLE">Dimension Style...</div>
+          <div class="menu-item" data-cmd="UNITS">Units...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="MATCHPROP">Match Properties</div>
+        </div>
+      </span>
+      <span data-menu="tools">Tools
+        <div class="menu-dropdown" id="menu-tools">
+          <div class="menu-item" data-cmd="OSNAP">Object Snap Settings...</div>
+          <div class="menu-item" data-cmd="OPTIONS">Options...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="DIST">Distance</div>
+          <div class="menu-item" data-cmd="AREA">Area</div>
+          <div class="menu-item" data-cmd="LIST">List</div>
+          <div class="menu-item" data-cmd="DIVIDE">Divide</div>
+          <div class="menu-item" data-cmd="SELECT">Select</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="PROPERTIES">Properties</div>
+          <div class="menu-item" data-cmd="GROUP">Group</div>
+        </div>
+      </span>
+      <span data-menu="draw">Draw
+        <div class="menu-dropdown" id="menu-draw">
+          <div class="menu-item" data-cmd="LINE">Line</div>
+          <div class="menu-item" data-cmd="CIRCLE">Circle</div>
+          <div class="menu-item" data-cmd="ARC">Arc</div>
+          <div class="menu-item" data-cmd="PLINE">Polyline</div>
+          <div class="menu-item" data-cmd="RECTANG">Rectangle</div>
+          <div class="menu-item" data-cmd="POLYGON">Polygon</div>
+          <div class="menu-item" data-cmd="ELLIPSE">Ellipse</div>
+          <div class="menu-item" data-cmd="SPLINE">Spline</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="POINT">Point</div>
+          <div class="menu-item" data-cmd="TEXT">Text</div>
+          <div class="menu-item" data-cmd="MTEXT">Multiline Text</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="HATCH">Hatch...</div>
+        </div>
+      </span>
+      <span data-menu="dimension">Dimension
+        <div class="menu-dropdown" id="menu-dimension">
+          <div class="menu-item" data-cmd="DIMLINEAR">Linear</div>
+          <div class="menu-item" data-cmd="DIMALIGNED">Aligned</div>
+          <div class="menu-item" data-cmd="DIMRADIUS">Radius</div>
+          <div class="menu-item" data-cmd="DIMDIAMETER">Diameter</div>
+          <div class="menu-item" data-cmd="DIMCONTINUE">Continue</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="DIMSTYLE">Style...</div>
+        </div>
+      </span>
+      <span data-menu="modify">Modify
+        <div class="menu-dropdown" id="menu-modify">
+          <div class="menu-item" data-cmd="ERASE">Erase</div>
+          <div class="menu-item" data-cmd="MOVE">Move</div>
+          <div class="menu-item" data-cmd="COPY">Copy</div>
+          <div class="menu-item" data-cmd="ROTATE">Rotate</div>
+          <div class="menu-item" data-cmd="SCALE">Scale</div>
+          <div class="menu-item" data-cmd="MIRROR">Mirror</div>
+          <div class="menu-item" data-cmd="OFFSET">Offset</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="TRIM">Trim</div>
+          <div class="menu-item" data-cmd="EXTEND">Extend</div>
+          <div class="menu-item" data-cmd="BREAK">Break</div>
+          <div class="menu-item" data-cmd="FILLET">Fillet</div>
+          <div class="menu-item" data-cmd="CHAMFER">Chamfer</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-cmd="EXPLODE">Explode</div>
+          <div class="menu-item" data-cmd="JOIN">Join</div>
+          <div class="menu-item" data-cmd="LENGTHEN">Lengthen</div>
+          <div class="menu-item" data-cmd="STRETCH">Stretch</div>
+          <div class="menu-item" data-cmd="ARRAY">Array</div>
+          <div class="menu-item" data-cmd="PEDIT">Polyline Edit</div>
+        </div>
+      </span>
+      <span data-menu="help">Help
+        <div class="menu-dropdown" id="menu-help">
+          <div class="menu-item" data-action="help">Command List<span class="menu-shortcut">F1</span></div>
+        </div>
+      </span>
+    </div>
+
+    <!-- Context menu (right-click) -->
+    <div id="context-menu"></div>
+
+    <!-- Draw toolbar -->
+    <div id="toolbar">
+      <button class="tb-btn" title="Open DXF" onclick="dxfOpen()">📂</button>
+      <button class="tb-btn" title="Save DXF" onclick="dxfSave()">💾</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Line (L)" onclick="cmd('LINE')">L</button>
+      <button class="tb-btn" title="Circle (C)" onclick="cmd('CIRCLE')">C</button>
+      <button class="tb-btn" title="Arc (A)" onclick="cmd('ARC')">A</button>
+      <button class="tb-btn" title="Polyline (PL)" onclick="cmd('PLINE')">PL</button>
+      <button class="tb-btn" title="Rectangle (REC)" onclick="cmd('RECTANG')">R</button>
+      <button class="tb-btn" title="Polygon (POL)" onclick="cmd('POLYGON')">PG</button>
+      <button class="tb-btn" title="Point (PO)" onclick="cmd('POINT')">PO</button>
+      <button class="tb-btn" title="Text (DT)" onclick="cmd('TEXT')">T</button>
+      <button class="tb-btn" title="Ellipse (EL)" onclick="cmd('ELLIPSE')">EL</button>
+      <button class="tb-btn" title="Spline (SPL)" onclick="cmd('SPLINE')">SP</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Erase (E)" onclick="cmd('ERASE')">E</button>
+      <button class="tb-btn" title="Move (M)" onclick="cmd('MOVE')">M</button>
+      <button class="tb-btn" title="Copy (CO)" onclick="cmd('COPY')">CO</button>
+      <button class="tb-btn" title="Rotate (RO)" onclick="cmd('ROTATE')">RO</button>
+      <button class="tb-btn" title="Mirror (MI)" onclick="cmd('MIRROR')">MI</button>
+      <button class="tb-btn" title="Offset (O)" onclick="cmd('OFFSET')">O</button>
+      <button class="tb-btn" title="Explode (X)" onclick="cmd('EXPLODE')">X</button>
+      <button class="tb-btn" title="Join (J)" onclick="cmd('JOIN')">J</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Trim (TR)" onclick="cmd('TRIM')">TR</button>
+      <button class="tb-btn" title="Extend (EX)" onclick="cmd('EXTEND')">EX</button>
+      <button class="tb-btn" title="Break (BR)" onclick="cmd('BREAK')">BR</button>
+      <button class="tb-btn" title="Fillet (F)" onclick="cmd('FILLET')">FI</button>
+      <button class="tb-btn" title="Chamfer (CHA)" onclick="cmd('CHAMFER')">CH</button>
+      <button class="tb-btn" title="Scale (SC)" onclick="cmd('SCALE')">SC</button>
+      <button class="tb-btn" title="Lengthen (LEN)" onclick="cmd('LENGTHEN')">LN</button>
+      <button class="tb-btn" title="Pedit (PE)" onclick="cmd('PEDIT')">PE</button>
+      <button class="tb-btn" title="Array (AR)" onclick="cmd('ARRAY')">AR</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Dim Linear (DLI)" onclick="cmd('DIMLINEAR')">DL</button>
+      <button class="tb-btn" title="Dim Aligned (DAL)" onclick="cmd('DIMALIGNED')">DA</button>
+      <button class="tb-btn" title="Dim Radius (DRA)" onclick="cmd('DIMRADIUS')">DR</button>
+      <button class="tb-btn" title="Dim Diameter (DDI)" onclick="cmd('DIMDIAMETER')">DD</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Distance (DI)" onclick="cmd('DIST')">DI</button>
+      <button class="tb-btn" title="Divide (DIV)" onclick="cmd('DIVIDE')">DV</button>
+      <button class="tb-btn" title="Zoom Extents (Z E)" onclick="cmd('ZOOM')">ZE</button>
+      <button class="tb-btn" title="Layer (LA)" onclick="cmd('LAYER')">LA</button>
+      <button class="tb-btn" title="Hatch (H)" onclick="cmd('HATCH')">H</button>
+      <button class="tb-btn" title="Block (B)" onclick="cmd('BLOCK')">B</button>
+      <button class="tb-btn" title="Insert (I)" onclick="cmd('INSERT')">I</button>
+      <div class="tb-sep"></div>
+      <button class="tb-btn" title="Undo (U)" onclick="cmd('UNDO')">↶</button>
+      <button class="tb-btn" title="Redo" onclick="cmd('REDO')">↷</button>
+    </div>
+
+    <!-- Drawing canvas -->
+    <div id="canvas-area">
+      <canvas id="cad-canvas"></canvas>
+    </div>
+
+    <!-- Command line -->
+    <div id="cmdline-area">
+      <div id="cmd-history"></div>
+      <div id="cmd-prompt-line">
+        <span id="cmd-prompt-label">Command:</span>
+        <input id="cmd-input" type="text" placeholder="Command:" autocomplete="off" spellcheck="false" />
+      </div>
+    </div>
+
+    <!-- Status bar -->
+    <div id="statusbar">
+      <span id="coord-display">0.0000, 0.0000, 0.0000</span>
+      <div class="status-sep"></div>
+      <span id="layer-display" style="font-weight:bold;color:#000;padding:0 6px;cursor:pointer;" title="Current layer" onclick="cmd('LAYER')">0</span>
+      <span id="snap-display" class="status-toggle active">OSNAP</span>
+      <span id="grid-display" class="status-toggle active">GRID</span>
+      <span id="gridsnap-display" class="status-toggle">snap</span>
+      <span id="ortho-display" class="status-toggle">ortho</span>
+    </div>
+  </div>
+
+  <script>
+    function cmd(name) {
+      const input = document.getElementById('cmd-input');
+      input.value = name;
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
+    }
+  </script>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>

@@ -1,0 +1,16 @@
+{
+  "name": "minicad",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal 2D CAD for laser cutting — AutoCAD R14 style",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.3"
+  }
+}
