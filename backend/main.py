@@ -2,7 +2,12 @@
 
 import io
 import math
+import os
+import sqlite3
+import tempfile
 import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import ezdxf
@@ -13,6 +18,31 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 app = FastAPI(title="MiniCAD DXF Backend")
+
+# ── Cloud storage setup ──
+
+STORAGE_DIR = Path(__file__).parent / "storage"
+STORAGE_DIR.mkdir(exist_ok=True)
+DB_PATH = STORAGE_DIR / "metadata.db"
+
+
+def _init_db() -> None:
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS dxf_files (
+            id TEXT PRIMARY KEY,
+            filename TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            entity_count INTEGER NOT NULL DEFAULT 0,
+            uploaded_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+_init_db()
 
 app.add_middleware(
     CORSMiddleware,
@@ -428,11 +458,15 @@ def health():
 @app.post("/api/dxf/import")
 async def dxf_import(file: UploadFile = File(...)):
     contents = await file.read()
-    stream = io.BytesIO(contents)
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    tmp.write(contents)
+    tmp.close()
     try:
-        doc = ezdxf.read(stream)
+        doc = ezdxf.readfile(tmp.name)
     except Exception as exc:
+        os.unlink(tmp.name)
         return {"error": f"Failed to parse DXF: {exc}"}
+    os.unlink(tmp.name)
 
     msp = doc.modelspace()
     entities: list[dict] = []
@@ -466,12 +500,12 @@ async def dxf_export(payload: ExportPayload):
     msp = doc.modelspace()
 
     for layer_data in payload.layers:
-        if layer_data["name"] != "0":
-            doc.layers.add(layer_data["name"], color=hex_to_aci(layer_data.get("color", "#ffffff")))
+        name = layer_data["name"]
+        color = hex_to_aci(layer_data.get("color", "#ffffff"))
+        if name in doc.layers:
+            doc.layers.get(name).color = color
         else:
-            layer0 = doc.layers.get("0")
-            if layer0:
-                layer0.color = hex_to_aci(layer_data.get("color", "#ffffff"))
+            doc.layers.add(name, color=color)
 
     for ent in payload.entities:
         write_entity(msp, ent, doc)
@@ -485,3 +519,153 @@ async def dxf_export(payload: ExportPayload):
         media_type="application/dxf",
         headers={"Content-Disposition": f'attachment; filename="{payload.filename}"'},
     )
+
+
+# ── Cloud Storage Endpoints ──
+
+
+class CloudSavePayload(BaseModel):
+    entities: list[dict]
+    layers: list[dict] = []
+    filename: str = "drawing.dxf"
+
+
+@app.post("/api/cloud/save")
+async def cloud_save(payload: CloudSavePayload):
+    """Save current drawing as DXF to cloud storage."""
+    doc = ezdxf.new(dxfversion="R2010", units=ezdxf.units.MM)
+    msp = doc.modelspace()
+
+    for layer_data in payload.layers:
+        name = layer_data["name"]
+        color = hex_to_aci(layer_data.get("color", "#ffffff"))
+        if name in doc.layers:
+            doc.layers.get(name).color = color
+        else:
+            doc.layers.add(name, color=color)
+
+    for ent in payload.entities:
+        write_entity(msp, ent, doc)
+
+    file_id = uuid.uuid4().hex[:12]
+    fname = payload.filename if payload.filename.endswith(".dxf") else payload.filename + ".dxf"
+    file_path = STORAGE_DIR / f"{file_id}.dxf"
+
+    doc.saveas(str(file_path))
+    file_size = file_path.stat().st_size
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT INTO dxf_files (id, filename, file_size, entity_count, uploaded_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (file_id, fname, file_size, len(payload.entities), now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"id": file_id, "filename": fname, "file_size": file_size, "entity_count": len(payload.entities)}
+
+
+@app.post("/api/cloud/upload")
+async def cloud_upload(file: UploadFile = File(...)):
+    """Upload a raw DXF file to cloud storage."""
+    contents = await file.read()
+    file_id = uuid.uuid4().hex[:12]
+    fname = file.filename or "upload.dxf"
+
+    file_path = STORAGE_DIR / f"{file_id}.dxf"
+    file_path.write_bytes(contents)
+
+    entity_count = 0
+    tmp = tempfile.NamedTemporaryFile(suffix=".dxf", delete=False)
+    tmp.write(contents)
+    tmp.close()
+    try:
+        doc = ezdxf.readfile(tmp.name)
+        msp = doc.modelspace()
+        for entity in msp:
+            entity_count += len(convert_entity(entity))
+    except Exception:
+        pass
+    os.unlink(tmp.name)
+
+    file_size = len(contents)
+    now = datetime.now(timezone.utc).isoformat()
+
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT INTO dxf_files (id, filename, file_size, entity_count, uploaded_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (file_id, fname, file_size, entity_count, now, now),
+    )
+    conn.commit()
+    conn.close()
+
+    return {"id": file_id, "filename": fname, "file_size": file_size, "entity_count": entity_count}
+
+
+@app.get("/api/cloud/list")
+def cloud_list():
+    """List all DXF files in cloud storage."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT * FROM dxf_files ORDER BY updated_at DESC").fetchall()
+    conn.close()
+    return {"files": [dict(r) for r in rows]}
+
+
+@app.get("/api/cloud/open/{file_id}")
+async def cloud_open(file_id: str):
+    """Open a DXF file from cloud storage, returning entities JSON."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM dxf_files WHERE id = ?", (file_id,)).fetchone()
+    conn.close()
+    if not row:
+        return {"error": "File not found"}
+
+    file_path = STORAGE_DIR / f"{file_id}.dxf"
+    if not file_path.exists():
+        return {"error": "File data missing from storage"}
+
+    try:
+        doc = ezdxf.readfile(str(file_path))
+    except Exception as exc:
+        return {"error": f"Failed to parse DXF: {exc}"}
+
+    msp = doc.modelspace()
+    entities: list[dict] = []
+    for entity in msp:
+        entities.extend(convert_entity(entity))
+
+    layers: list[dict] = []
+    for layer in doc.layers:
+        layers.append({
+            "name": layer.dxf.name,
+            "color": aci_to_hex(layer.color),
+            "visible": not layer.is_off,
+            "locked": layer.is_locked,
+            "current": layer.dxf.name == "0",
+        })
+    if not layers:
+        layers.append({"name": "0", "color": "#ffffff", "visible": True, "locked": False, "current": True})
+
+    return {"entities": entities, "layers": layers, "count": len(entities), "filename": row["filename"]}
+
+
+@app.delete("/api/cloud/delete/{file_id}")
+def cloud_delete(file_id: str):
+    """Delete a DXF file from cloud storage."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute("SELECT id FROM dxf_files WHERE id = ?", (file_id,)).fetchone()
+    if not row:
+        conn.close()
+        return {"error": "File not found"}
+    conn.execute("DELETE FROM dxf_files WHERE id = ?", (file_id,))
+    conn.commit()
+    conn.close()
+
+    file_path = STORAGE_DIR / f"{file_id}.dxf"
+    if file_path.exists():
+        file_path.unlink()
+
+    return {"ok": True}

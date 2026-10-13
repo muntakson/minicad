@@ -206,6 +206,51 @@
     #cmd-history::-webkit-scrollbar { width: 8px; }
     #cmd-history::-webkit-scrollbar-track { background: #000; }
     #cmd-history::-webkit-scrollbar-thumb { background: #444; }
+
+    /* Cloud dialog */
+    .cloud-overlay {
+      display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.6); z-index: 9999; align-items: center; justify-content: center;
+    }
+    .cloud-overlay.open { display: flex; }
+    .cloud-dialog {
+      background: var(--bg-panel); border: 2px solid #808080; color: #c0c0c0;
+      width: 520px; max-height: 70vh; font-family: 'Segoe UI', Tahoma, sans-serif; font-size: 12px;
+    }
+    .cloud-dialog-title {
+      background: #000080; color: #fff; padding: 3px 6px; font-weight: bold; font-size: 12px;
+      display: flex; justify-content: space-between; align-items: center;
+    }
+    .cloud-dialog-title button {
+      background: #c0c0c0; border: 1px outset #c0c0c0; color: #000; font-size: 11px;
+      width: 18px; height: 18px; cursor: pointer; line-height: 1;
+    }
+    .cloud-dialog-body { padding: 10px; }
+    .cloud-file-list {
+      border: 1px inset #808080; background: #000; max-height: 280px; overflow-y: auto; margin-bottom: 8px;
+    }
+    .cloud-file-row {
+      padding: 4px 8px; cursor: pointer; display: flex; justify-content: space-between;
+      border-bottom: 1px solid #333;
+    }
+    .cloud-file-row:hover { background: #000080; color: #fff; }
+    .cloud-file-row.selected { background: #000080; color: #fff; }
+    .cloud-file-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cloud-file-meta { color: #808080; font-size: 11px; margin-left: 12px; white-space: nowrap; }
+    .cloud-file-row.selected .cloud-file-meta { color: #c0c0c0; }
+    .cloud-btn-row { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+    .cloud-btn {
+      background: #c0c0c0; border: 2px outset #c0c0c0; color: #000; padding: 3px 16px;
+      font-size: 12px; cursor: pointer; min-width: 70px;
+    }
+    .cloud-btn:hover { background: #d0d0d0; color: #000; }
+    .cloud-btn:active { border-style: inset; }
+    .cloud-btn.primary { font-weight: bold; }
+    .cloud-save-input {
+      width: 100%; box-sizing: border-box; background: #000; color: #c0c0c0;
+      border: 1px inset #808080; padding: 3px 6px; font-size: 12px; margin-bottom: 8px;
+    }
+    .cloud-empty { padding: 20px; text-align: center; color: #808080; }
   </style>
 </head>
 <body>
@@ -217,6 +262,9 @@
           <div class="menu-item" data-action="new">New</div>
           <div class="menu-item" data-action="open">Open DXF...</div>
           <div class="menu-item" data-action="save">Save DXF...</div>
+          <div class="menu-sep"></div>
+          <div class="menu-item" data-action="cloud-open">Open from Cloud...</div>
+          <div class="menu-item" data-action="cloud-save">Save to Cloud...</div>
           <div class="menu-sep"></div>
           <div class="menu-item" data-action="exit">Exit</div>
         </div>
@@ -419,6 +467,8 @@
       <span id="grid-display" class="status-toggle active">GRID</span>
       <span id="gridsnap-display" class="status-toggle">snap</span>
       <span id="ortho-display" class="status-toggle">ortho</span>
+      <span id="lwt-toggle" class="status-toggle">lwt</span>
+      <span id="polar-display" class="status-toggle">polar</span>
     </div>
   </div>
 
@@ -429,6 +479,9 @@
       input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter' }));
     }
   </script>
+  <div class="cloud-overlay" id="cloud-overlay">
+    <div class="cloud-dialog" id="cloud-dialog"></div>
+  </div>
   <script type="module" src="/src/main.ts"></script>
 </body>
 </html>

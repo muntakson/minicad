@@ -13,6 +13,8 @@ const snapDisplay = document.getElementById('snap-display') as HTMLSpanElement;
 const orthoDisplay = document.getElementById('ortho-display') as HTMLSpanElement;
 const gridDisplay = document.getElementById('grid-display') as HTMLSpanElement;
 const gridSnapDisplay = document.getElementById('gridsnap-display') as HTMLSpanElement;
+const polarDisplay = document.getElementById('polar-display') as HTMLSpanElement;
+const lwtToggle = document.getElementById('lwt-toggle') as HTMLSpanElement;
 const layerDisplay = document.getElementById('layer-display') as HTMLSpanElement;
 const contextMenu = document.getElementById('context-menu') as HTMLDivElement;
 const menubar = document.getElementById('menubar') as HTMLDivElement;
@@ -63,18 +65,59 @@ canvas.addEventListener('mousemove', (e) => {
     constrained = applyOrtho(world);
   }
 
+  // Polar tracking constraint
+  if (store.polarTrackingOn && engine.isActive && !store.orthoOn) {
+    const base = store.lastPoint;
+    const dx = constrained.x - base.x;
+    const dy = constrained.y - base.y;
+    const cursorAngle = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
+    const increment = store.polarTrackingAngle;
+    const tolerance = 5; // degrees
+    let bestAngle = -1;
+    let bestDiff = tolerance;
+    for (let a = 0; a < 360; a += increment) {
+      let diff = Math.abs(cursorAngle - a);
+      if (diff > 180) diff = 360 - diff;
+      if (diff < bestDiff) {
+        bestDiff = diff;
+        bestAngle = a;
+      }
+    }
+    if (bestAngle >= 0) {
+      const d = Math.hypot(dx, dy);
+      const rad = bestAngle * Math.PI / 180;
+      const projDist = dx * Math.cos(rad) + dy * Math.sin(rad);
+      constrained = {
+        x: base.x + projDist * Math.cos(rad),
+        y: base.y + projDist * Math.sin(rad),
+      };
+      renderer.polarTrackLine = {
+        from: base,
+        to: constrained,
+        angle: bestAngle,
+        distance: Math.abs(projDist),
+      };
+    } else {
+      renderer.polarTrackLine = null;
+    }
+  } else {
+    renderer.polarTrackLine = null;
+  }
+
   // Snap
   const snap = findSnap(constrained, { x: sx, y: sy });
   renderer.snapResult = snap;
   renderer.cursorWorld = snap.point;
 
-  // Coordinate display
+  // Coordinate display (in UCS space)
   if (store.coordDisplayMode === 'cartesian') {
     const p = store.unitPrecision;
-    coordDisplay.textContent = `${snap.point.x.toFixed(p)}, ${snap.point.y.toFixed(p)}, ${'0'.padEnd(p + 2, p > 0 ? '0' : '')}`;
+    const ucs = store.wcsToUcs(snap.point);
+    coordDisplay.textContent = `${ucs.x.toFixed(p)}, ${ucs.y.toFixed(p)}, ${'0'.padEnd(p + 2, p > 0 ? '0' : '')}`;
   } else if (store.coordDisplayMode === 'polar') {
-    const base = store.lastPoint;
-    const dx = snap.point.x - base.x, dy = snap.point.y - base.y;
+    const base = store.wcsToUcs(store.lastPoint);
+    const cur = store.wcsToUcs(snap.point);
+    const dx = cur.x - base.x, dy = cur.y - base.y;
     const d = Math.hypot(dx, dy);
     const a = (Math.atan2(dy, dx) * 180 / Math.PI + 360) % 360;
     coordDisplay.textContent = `${d.toFixed(store.unitPrecision)}<${a.toFixed(1)}°`;
@@ -95,6 +138,26 @@ canvas.addEventListener('mousemove', (e) => {
 
   if (gripEdit) {
     renderer.gripRubberBand = { start: gripEdit.origin, end: snap.point };
+  }
+
+  // Hover highlighting: detect entity under cursor when idle
+  if (!engine.isActive && !isPanning && !isPanningCmd && !isDraggingSelBox && !gripEdit) {
+    const hoverTol = 10 / store.view.zoom;
+    let hoverHit: Entity | null = null;
+    for (let i = store.entities.length - 1; i >= 0; i--) {
+      const ent = store.entities[i];
+      if (!ent.visible || ent.selected) continue;
+      if (store.hiddenEntityIds.has(ent.id)) continue;
+      const eLayer = store.layers.find(l => l.name === ent.layer);
+      if (eLayer && eLayer.frozen) continue;
+      if (pointOnEntityCheck(snap.point, ent, hoverTol)) {
+        hoverHit = ent;
+        break;
+      }
+    }
+    store.hoveredEntityId = hoverHit ? hoverHit.id : null;
+  } else {
+    store.hoveredEntityId = null;
   }
 
   engine.handleMove(snap.point);
@@ -118,6 +181,7 @@ canvas.addEventListener('mousedown', (e) => {
     return;
   }
   if (e.button === 0) {
+    store.hoveredEntityId = null;
     const snap = renderer.snapResult;
     const pt = snap ? snap.point : renderer.cursorWorld;
 
@@ -136,7 +200,7 @@ canvas.addEventListener('mousedown', (e) => {
 
     if (!engine.isActive) {
       // Check if click is on an existing grip
-      const gripTol = 6 / store.view.zoom;
+      const gripTol = 8 / store.view.zoom;
       for (const ent of store.entities) {
         if (!ent.visible || !ent.selected) continue;
         const grips = getGripPoints(ent);
@@ -368,6 +432,72 @@ cmdInput.addEventListener('keydown', (e) => {
 
 // Global keyboard — always focus command line when typing
 document.addEventListener('keydown', (e) => {
+  // Delete key — erase selected entities (works from anywhere)
+  if (e.key === 'Delete' && !engine.isActive) {
+    const sel = store.selectedEntities();
+    if (sel.length > 0) {
+      e.preventDefault();
+      store.pushUndo('ERASE');
+      for (const ent of sel) store.removeEntity(ent.id);
+      store.emit();
+      appendHistory(`${sel.length} object(s) erased`);
+      cmdInput.focus();
+      return;
+    }
+  }
+
+  // Ctrl+C — copy selected to internal clipboard
+  if (e.ctrlKey && e.key === 'c') {
+    const sel = store.selectedEntities();
+    if (sel.length > 0) {
+      e.preventDefault();
+      store.clipboard = JSON.parse(JSON.stringify(sel));
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const ent of sel) {
+        const b = entityBounds(ent);
+        if (b) { minX = Math.min(minX, b.min.x); minY = Math.min(minY, b.min.y); maxX = Math.max(maxX, b.max.x); maxY = Math.max(maxY, b.max.y); }
+      }
+      store.clipboardBase = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+      appendHistory(`${sel.length} object(s) copied to clipboard`);
+      return;
+    }
+  }
+
+  // Ctrl+V — paste from internal clipboard
+  if (e.ctrlKey && e.key === 'v') {
+    if (store.clipboard.length > 0) {
+      e.preventDefault();
+      engine.handleInput('PASTECLIP');
+      cmdInput.focus();
+      return;
+    }
+  }
+
+  // Ctrl+Z / Ctrl+Y — undo/redo (works from anywhere)
+  if (e.ctrlKey && e.key === 'z') { e.preventDefault(); engine.handleInput('UNDO'); return; }
+  if (e.ctrlKey && e.key === 'y') { e.preventDefault(); engine.handleInput('REDO'); return; }
+
+  // Ctrl+X — cut selected to internal clipboard
+  if (e.ctrlKey && e.key === 'x') {
+    const sel = store.selectedEntities();
+    if (sel.length > 0) {
+      e.preventDefault();
+      store.clipboard = JSON.parse(JSON.stringify(sel));
+      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+      for (const ent of sel) {
+        const b = entityBounds(ent);
+        if (b) { minX = Math.min(minX, b.min.x); minY = Math.min(minY, b.min.y); maxX = Math.max(maxX, b.max.x); maxY = Math.max(maxY, b.max.y); }
+      }
+      store.clipboardBase = { x: (minX + maxX) / 2, y: (minY + maxY) / 2 };
+      store.pushUndo('CUTCLIP');
+      for (const ent of sel) store.removeEntity(ent.id);
+      store.emit();
+      appendHistory(`${sel.length} object(s) cut to clipboard`);
+      cmdInput.focus();
+      return;
+    }
+  }
+
   // Don't intercept if already focused on input
   if (document.activeElement === cmdInput) {
     if (e.key === 'F1') { e.preventDefault(); showHelp(); return; }
@@ -376,12 +506,9 @@ document.addEventListener('keydown', (e) => {
     if (e.key === 'F7') { e.preventDefault(); engine.handleInput('GRID'); return; }
     if (e.key === 'F8') { e.preventDefault(); engine.handleInput('ORTHO'); return; }
     if (e.key === 'F9') { e.preventDefault(); toggleGridSnap(); return; }
+    if (e.key === 'F10') { e.preventDefault(); togglePolarTracking(); return; }
     return;
   }
-
-  // Ctrl shortcuts
-  if (e.ctrlKey && e.key === 'z') { e.preventDefault(); engine.handleInput('UNDO'); return; }
-  if (e.ctrlKey && e.key === 'y') { e.preventDefault(); engine.handleInput('REDO'); return; }
 
   if (e.key === 'Escape') {
     if (contextMenu.classList.contains('open')) { contextMenu.classList.remove('open'); return; }
@@ -404,6 +531,7 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'F7') { e.preventDefault(); engine.handleInput('GRID'); return; }
   if (e.key === 'F8') { e.preventDefault(); engine.handleInput('ORTHO'); return; }
   if (e.key === 'F9') { e.preventDefault(); toggleGridSnap(); return; }
+  if (e.key === 'F10') { e.preventDefault(); togglePolarTracking(); return; }
 
   // Enter/Space outside cmdInput — forward to engine (critical for multi-step commands
   // like TRIM where clicking the canvas steals focus from cmdInput)
@@ -434,6 +562,8 @@ snapDisplay.addEventListener('click', () => toggleOsnap());
 orthoDisplay.addEventListener('click', () => { engine.handleInput('ORTHO'); });
 gridDisplay.addEventListener('click', () => { engine.handleInput('GRID'); });
 gridSnapDisplay.addEventListener('click', () => toggleGridSnap());
+if (polarDisplay) polarDisplay.addEventListener('click', () => togglePolarTracking());
+lwtToggle.addEventListener('click', () => { store.lwDisplay = !store.lwDisplay; store.emit(); });
 
 // === RENDER LOOP ===
 
@@ -450,6 +580,12 @@ function frame() {
   gridDisplay.className = store.gridOn ? 'status-toggle active' : 'status-toggle';
   gridSnapDisplay.textContent = store.snapToGrid ? 'SNAP' : 'snap';
   gridSnapDisplay.className = store.snapToGrid ? 'status-toggle active' : 'status-toggle';
+  if (polarDisplay) {
+    polarDisplay.textContent = store.polarTrackingOn ? 'POLAR' : 'polar';
+    polarDisplay.className = store.polarTrackingOn ? 'status-toggle active' : 'status-toggle';
+  }
+  lwtToggle.textContent = store.lwDisplay ? 'LWT' : 'lwt';
+  lwtToggle.className = store.lwDisplay ? 'status-toggle active' : 'status-toggle';
   const curLayer = store.currentLayer();
   layerDisplay.textContent = curLayer.name;
   layerDisplay.style.color = curLayer.color === '#ffffff' ? '#000' : curLayer.color;
@@ -488,13 +624,15 @@ async function dxfOpen() {
       const res = await fetch(`${API_BASE}/api/dxf/import`, { method: 'POST', body: form });
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      if (!data.entities) throw new Error('No entities in response');
       store.pushUndo('OPEN');
       store.entities = data.entities;
       if (data.layers) {
         store.layers = data.layers.map((l: any) => ({
           name: l.name, color: l.color || '#ffffff',
           visible: true, locked: false, frozen: false, current: l.name === '0',
-          lineweight: l.lineweight || 1,
+          lineweight: l.lineweight || 1, plot: true,
         }));
       }
       store.emit();
@@ -507,14 +645,19 @@ async function dxfOpen() {
   input.click();
 }
 
-async function dxfSave() {
+async function dxfSave(layerFilter?: string[]) {
   promptFn('Saving DXF...');
   try {
+    const plottableLayers = new Set(store.layers.filter(l => l.plot !== false).map(l => l.name));
+    let entities = store.entities.filter(e => plottableLayers.has(e.layer));
+    if (layerFilter && layerFilter.length > 0) {
+      entities = entities.filter(e => layerFilter.includes(e.layer));
+    }
     const res = await fetch(`${API_BASE}/api/dxf/export`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        entities: store.entities,
+        entities: entities,
         layers: store.layers,
         filename: 'drawing.dxf',
       }),
@@ -531,11 +674,190 @@ async function dxfSave() {
   }
 }
 
+// ── Cloud Storage ──
+
+function cloudDialog(): { overlay: HTMLElement; dialog: HTMLElement } {
+  const overlay = document.getElementById('cloud-overlay')!;
+  const dialog = document.getElementById('cloud-dialog')!;
+  return { overlay, dialog };
+}
+
+function closeCloudDialog() {
+  const { overlay } = cloudDialog();
+  overlay.classList.remove('open');
+}
+
+function formatFileSize(bytes: number): string {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+async function cloudSave() {
+  const { overlay, dialog } = cloudDialog();
+  dialog.innerHTML = `
+    <div class="cloud-dialog-title">
+      <span>Save to Cloud</span>
+      <button id="cloud-close">&times;</button>
+    </div>
+    <div class="cloud-dialog-body">
+      <div style="margin-bottom:4px">Filename:</div>
+      <input class="cloud-save-input" id="cloud-save-name" value="drawing.dxf" />
+      <div class="cloud-btn-row">
+        <button class="cloud-btn primary" id="cloud-save-ok">Save</button>
+        <button class="cloud-btn" id="cloud-save-cancel">Cancel</button>
+      </div>
+    </div>`;
+  overlay.classList.add('open');
+
+  dialog.querySelector('#cloud-close')!.addEventListener('click', closeCloudDialog);
+  dialog.querySelector('#cloud-save-cancel')!.addEventListener('click', closeCloudDialog);
+
+  dialog.querySelector('#cloud-save-ok')!.addEventListener('click', async () => {
+    const nameInput = dialog.querySelector('#cloud-save-name') as HTMLInputElement;
+    const filename = nameInput.value.trim() || 'drawing.dxf';
+    closeCloudDialog();
+    promptFn('Saving to cloud...');
+    try {
+      const res = await fetch(`${API_BASE}/api/cloud/save`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          entities: store.entities,
+          layers: store.layers,
+          filename,
+        }),
+      });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+      promptFn(`Saved to cloud: ${data.filename} (${data.entity_count} entities)`);
+    } catch (e: any) {
+      promptFn(`Error: ${e.message}`);
+    }
+  });
+
+  const nameInput = dialog.querySelector('#cloud-save-name') as HTMLInputElement;
+  nameInput.select();
+  nameInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') dialog.querySelector<HTMLButtonElement>('#cloud-save-ok')!.click();
+    if (e.key === 'Escape') closeCloudDialog();
+  });
+}
+
+async function cloudOpen() {
+  const { overlay, dialog } = cloudDialog();
+  dialog.innerHTML = `
+    <div class="cloud-dialog-title">
+      <span>Open from Cloud</span>
+      <button id="cloud-close">&times;</button>
+    </div>
+    <div class="cloud-dialog-body">
+      <div class="cloud-file-list" id="cloud-file-list">
+        <div class="cloud-empty">Loading...</div>
+      </div>
+      <div class="cloud-btn-row">
+        <button class="cloud-btn primary" id="cloud-open-ok" disabled>Open</button>
+        <button class="cloud-btn" id="cloud-open-delete" disabled>Delete</button>
+        <button class="cloud-btn" id="cloud-open-cancel">Cancel</button>
+      </div>
+    </div>`;
+  overlay.classList.add('open');
+
+  dialog.querySelector('#cloud-close')!.addEventListener('click', closeCloudDialog);
+  dialog.querySelector('#cloud-open-cancel')!.addEventListener('click', closeCloudDialog);
+
+  let selectedId: string | null = null;
+
+  async function loadList() {
+    const listEl = dialog.querySelector('#cloud-file-list')!;
+    try {
+      const res = await fetch(`${API_BASE}/api/cloud/list`);
+      const data = await res.json();
+      if (!data.files || data.files.length === 0) {
+        listEl.innerHTML = '<div class="cloud-empty">No files saved in cloud storage.</div>';
+        return;
+      }
+      listEl.innerHTML = data.files.map((f: any) => `
+        <div class="cloud-file-row" data-id="${f.id}">
+          <span class="cloud-file-name">${f.filename}</span>
+          <span class="cloud-file-meta">${f.entity_count} ent &middot; ${formatFileSize(f.file_size)} &middot; ${formatDate(f.uploaded_at)}</span>
+        </div>`).join('');
+
+      listEl.addEventListener('click', (e) => {
+        const row = (e.target as HTMLElement).closest('.cloud-file-row') as HTMLElement;
+        if (!row) return;
+        listEl.querySelectorAll('.cloud-file-row').forEach(r => r.classList.remove('selected'));
+        row.classList.add('selected');
+        selectedId = row.dataset.id!;
+        (dialog.querySelector('#cloud-open-ok') as HTMLButtonElement).disabled = false;
+        (dialog.querySelector('#cloud-open-delete') as HTMLButtonElement).disabled = false;
+      });
+
+      listEl.addEventListener('dblclick', (e) => {
+        const row = (e.target as HTMLElement).closest('.cloud-file-row') as HTMLElement;
+        if (!row) return;
+        selectedId = row.dataset.id!;
+        dialog.querySelector<HTMLButtonElement>('#cloud-open-ok')!.click();
+      });
+    } catch {
+      listEl.innerHTML = '<div class="cloud-empty">Failed to load file list.</div>';
+    }
+  }
+
+  await loadList();
+
+  dialog.querySelector('#cloud-open-ok')!.addEventListener('click', async () => {
+    if (!selectedId) return;
+    closeCloudDialog();
+    promptFn('Opening from cloud...');
+    try {
+      const res = await fetch(`${API_BASE}/api/cloud/open/${selectedId}`);
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      if (!data.entities) throw new Error('No entities in response');
+      store.pushUndo('CLOUD_OPEN');
+      store.entities = data.entities;
+      if (data.layers) {
+        store.layers = data.layers.map((l: any) => ({
+          name: l.name, color: l.color || '#ffffff',
+          visible: true, locked: false, frozen: false, current: l.name === '0',
+          lineweight: l.lineweight || 1, plot: true,
+        }));
+      }
+      store.emit();
+      zoomExtents();
+      promptFn(`Opened ${data.filename}: ${data.count} entities`);
+    } catch (e: any) {
+      promptFn(`Error: ${e.message}`);
+    }
+  });
+
+  dialog.querySelector('#cloud-open-delete')!.addEventListener('click', async () => {
+    if (!selectedId) return;
+    if (!confirm('Delete this file from cloud storage?')) return;
+    try {
+      await fetch(`${API_BASE}/api/cloud/delete/${selectedId}`, { method: 'DELETE' });
+      selectedId = null;
+      (dialog.querySelector('#cloud-open-ok') as HTMLButtonElement).disabled = true;
+      (dialog.querySelector('#cloud-open-delete') as HTMLButtonElement).disabled = true;
+      await loadList();
+    } catch (e: any) {
+      promptFn(`Error: ${e.message}`);
+    }
+  });
+}
+
 // Expose to toolbar buttons and tests
 (window as any).dxfOpen = dxfOpen;
 (window as any).dxfSave = dxfSave;
 (window as any).__store = store;
 (window as any).__engine = engine;
+(window as any).__findSnap = findSnap;
 
 // === FUNCTION KEY HELPERS ===
 
@@ -551,15 +873,15 @@ function showHelp() {
   appendHistory('Annot:   TEXTALIGN(TA) SCALETEXT HATCHEDIT(HE) QLEADER(QL) FIELD(FI) TABLE(TB) TABLESTYLE(TS) TINSERT(TI)');
   appendHistory('Blocks:  BLOCK(B) INSERT(I) MINSERT WBLOCK(WB) ATTDEF(ATT) ATTEDIT(ATE) ATTEXT ATTDISP BATTMAN SHAPE(SHP)');
   appendHistory('Xref:    XREF(XR) XBIND(XB) XCLIP IMAGEATTACH(IAT) IMAGEADJUST(IAD) IMAGECLIP(ICL) IMAGEFRAME REVCLOUDPROPERTIES(RCP)');
-  appendHistory('I/O:     EXPORT(EXP) IMPORT(IMP) PLOT(PP) PASTESPEC ETRANSMIT');
+  appendHistory('I/O:     EXPORT(EXP) IMPORT(IMP) PLOT(PP) EXPORTLAYERS(EXL) PASTESPEC ETRANSMIT');
   appendHistory('View:    ZOOM(Z) PAN(P) VIEW(V) REGENALL(REA) VPOINT(VP) PLAN DVIEW DDVPOINT');
   appendHistory('Viewport: MVIEW(MV) VPCLIP MSPACE(MS) PSPACE(PS) CHSPACE LAYOUT(LAY)');
-  appendHistory('Layers:  LAYOFF LAYON LAYFRZ LAYTHW LAYLCK LAYULK LAYDEL LAYMRG LAYERSTATE(LAS) LAYWALK LAYERP(LP)');
+  appendHistory('Layers:  LAYOFF LAYON LAYFRZ LAYTHW LAYLCK LAYULK LAYDEL LAYMRG LAYERSTATE(LAS) LAYWALK LAYERP(LP) LAYERPLOT(LPLOT) CONSTRUCTION(CONST)');
   appendHistory('Select:  SELECT(SEL) QSELECT(QS) SELECTALL DESELECTALL SELECTPREVIOUS(SELECTP) SELECTSIMILAR(SELSIM) ADDSELECTED FILTER');
   appendHistory('Object:  ISOLATEOBJECTS HIDEOBJECTS UNISOLATEOBJECTS LAYMCUR LAYISO LAYUNISO HYPERLINK(HYP)');
   appendHistory('Inquiry: DIST(DI) AREA(AA) LIST(LI) DIVIDE(DIV) DBLIST MASSPROP ID');
   appendHistory('Coord:   UCS UCSMAN ISOPLANE ELEV THICKNESS');
-  appendHistory('Settings: LAYER(LA) LINETYPE(LT) LINEWEIGHT(LW) OSNAP(OS) GRID(G) UNITS(UN) FILL DDPTYPE QTEXT(QT) MATCHPROP(MA) VIEWRES APERTURE');
+  appendHistory('Settings: LAYER(LA) LINETYPE(LT) LINEWEIGHT(LW) LWDISPLAY(LWT) OSNAP(OS) GRID(G) UNITS(UN) FILL DDPTYPE QTEXT(QT) MATCHPROP(MA) VIEWRES APERTURE');
   appendHistory('         DSETTINGS(DS) DDGRIPS SCALELISTEDIT(SLE) DRAGMODE BLIPMODE HANDLES REINIT');
   appendHistory('Utility: BASE MULTIPLE(MUL) SETVAR STATUS AUDIT PURGE(PU) RENAME(REN) CAL(QC) TIME COPYCLIP PASTECLIP CUTCLIP ABOUT EXIT QSAVE');
   appendHistory('         DWGPROPS MIRRTEXT TEXTTOFRONT(TTF) CLEANSCREEN BPOLY(BP) BOUNDARY(BO) SCRIPT(SCR) SHELL OBJECTSCALE PAGESETUP RECOVER CLOSEALL CONVERT DELAY');
@@ -568,7 +890,7 @@ function showHelp() {
   appendHistory('         DATAEXTRACTION(DX) EATTEXT DRAWINGRECOVERY TABLETCONFIG TABLET COMPILE');
   appendHistory('3D/Rend: 3DFACE 3DMESH 3DPOLY 3DSIN SURFREV SURFTAB1 SURFTAB2 EDGESURF RULESURF TABSURF REVSURF HIDE SHADE RENDER LIGHT SCENE RPREF');
   appendHistory('Script:  MENU MENULOAD MENUUNLOAD TBCONFIG APPLOAD ARX VBARUN VBAIDE VBALOAD RESUME GRAPHSCR TEXTSCR MSLIDE VSLIDE');
-  appendHistory('Shortcuts: Ctrl+Z=Undo Ctrl+Y=Redo  F3=Osnap F6=Coords F7=Grid F8=Ortho F9=GridSnap');
+  appendHistory('Shortcuts: Ctrl+Z=Undo Ctrl+Y=Redo  F3=Osnap F6=Coords F7=Grid F8=Ortho F9=GridSnap F10=Polar');
 }
 
 function toggleOsnap() {
@@ -591,6 +913,12 @@ function toggleCoordDisplay() {
 function toggleGridSnap() {
   store.snapToGrid = !store.snapToGrid;
   promptFn(`Grid Snap ${store.snapToGrid ? 'ON' : 'OFF'}`);
+}
+
+function togglePolarTracking() {
+  store.polarTrackingOn = !store.polarTrackingOn;
+  if (store.polarTrackingOn) store.orthoOn = false;
+  promptFn(`Polar Tracking ${store.polarTrackingOn ? 'ON' : 'OFF'} (${store.polarTrackingAngle}°)`);
 }
 
 // === DROPDOWN MENUS ===
@@ -664,6 +992,8 @@ function handleMenuAction(action: string) {
       break;
     case 'open': dxfOpen(); break;
     case 'save': dxfSave(); break;
+    case 'cloud-open': cloudOpen(); break;
+    case 'cloud-save': cloudSave(); break;
     case 'exit': promptFn('Close the browser tab to exit.'); break;
     case 'selectall':
       for (const e of store.entities) if (e.visible) e.selected = true;
