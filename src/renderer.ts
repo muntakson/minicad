@@ -1,6 +1,7 @@
-import { Entity, Point, SnapResult, SnapMode, BlockRefEntity, DimStyle } from './types';
+import { Entity, Point, SnapResult, SnapMode, BlockRefEntity, DimStyle, PolylineEntity } from './types';
 import { store } from './store';
-import { polarPoint, angleInArc, normalizeAngle, getGripPoints, isHorizontalDim, dist, angle } from './geometry';
+import { polarPoint, angleInArc, normalizeAngle, getGripPoints, isHorizontalDim, dist, angle, bulgeArc } from './geometry';
+import { renderShelterOverlay } from './shelter';
 
 const COLORS: Record<string, string> = {
   '1': '#ff0000', '2': '#ffff00', '3': '#00ff00', '4': '#00ffff',
@@ -44,6 +45,7 @@ export class Renderer {
   hotGrip: { entityId: string; gripIndex: number } | null = null;
   gripRubberBand: { start: Point; end: Point } | null = null;
   preview: ((ctx: CanvasRenderingContext2D) => void) | null = null;
+  polarTrackLine: { from: Point; to: Point; angle: number; distance: number } | null = null;
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -70,6 +72,22 @@ export class Renderer {
     // Grid
     if (store.gridOn) this.drawGrid(w, h);
 
+    // Raster overlays (satellite, cadastral images)
+    for (const ov of store.rasterOverlays) {
+      const ovLayer = store.layers.find(l => l.name === ov.layer);
+      if (ovLayer && !ovLayer.visible) continue;
+      if (ovLayer && ovLayer.frozen) continue;
+      const tl = store.worldToScreen({ x: ov.bounds.minX, y: ov.bounds.maxY });
+      const br = store.worldToScreen({ x: ov.bounds.maxX, y: ov.bounds.minY });
+      const dw = br.x - tl.x;
+      const dh = br.y - tl.y;
+      if (dw > 0 && dh > 0) {
+        ctx.globalAlpha = 0.85;
+        ctx.drawImage(ov.image, tl.x, tl.y, dw, dh);
+        ctx.globalAlpha = 1.0;
+      }
+    }
+
     // Entities
     for (const e of store.entities) {
       if (!e.visible) continue;
@@ -79,21 +97,7 @@ export class Renderer {
     }
 
     // Grips on selected entities
-    for (const e of store.entities) {
-      if (!e.visible || !e.selected) continue;
-      const grips = getGripPoints(e);
-      for (let gi = 0; gi < grips.length; gi++) {
-        const sp = store.worldToScreen(grips[gi]);
-        const isHot = this.hotGrip && this.hotGrip.entityId === e.id && this.hotGrip.gripIndex === gi;
-        ctx.fillStyle = isHot ? '#ff0000' : '#0055ff';
-        ctx.fillRect(sp.x - 4, sp.y - 4, 8, 8);
-        if (isHot) {
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(sp.x - 4, sp.y - 4, 8, 8);
-        }
-      }
-    }
+    this.drawGrips();
 
     // Grip rubber band
     if (this.gripRubberBand) {
@@ -147,6 +151,27 @@ export class Renderer {
       this.preview(ctx);
     }
 
+    // Polar tracking line
+    if (this.polarTrackLine) {
+      const ptl = this.polarTrackLine;
+      const sf = store.worldToScreen(ptl.from);
+      const st = store.worldToScreen(ptl.to);
+      ctx.setLineDash([4, 4]);
+      ctx.strokeStyle = '#00ff00';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(sf.x, sf.y);
+      ctx.lineTo(st.x, st.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Tooltip with angle and distance
+      const mx = (sf.x + st.x) / 2;
+      const my = (sf.y + st.y) / 2;
+      ctx.font = '10px monospace';
+      ctx.fillStyle = '#00ff00';
+      ctx.fillText(`${ptl.distance.toFixed(2)} < ${ptl.angle.toFixed(1)}°`, mx + 10, my - 6);
+    }
+
     // Selection box
     if (this.selectionBox) {
       const s1 = store.worldToScreen(this.selectionBox.p1);
@@ -168,30 +193,65 @@ export class Renderer {
     // Crosshair cursor (full screen, R14 style)
     this.drawCrosshair(w, h);
 
+    // Scale bar (bottom-right)
+    this.drawScaleBar(w, h);
+
     // UCS icon (bottom-left)
     this.drawUCSIcon();
+
+    // Shelter placement overlay
+    renderShelterOverlay(ctx, w, h);
   }
 
   private drawGrid(w: number, h: number) {
     const ctx = this.ctx;
     const gs = store.gridSpacing;
     const v = store.view;
+    const ucsOrig = store.ucsOrigin;
+    const ucsRad = store.ucsAngle * Math.PI / 180;
+    const hasUCS = store.isUCS();
 
     const worldLeft = v.panX;
     const worldRight = v.panX + w / v.zoom;
     const worldBottom = v.panY - h / v.zoom;
     const worldTop = v.panY;
 
-    const startX = Math.floor(worldLeft / gs) * gs;
-    const startY = Math.floor(worldBottom / gs) * gs;
-
-    ctx.fillStyle = '#333333';
     const dotSize = Math.max(1, v.zoom * 0.8);
+    const majorEvery = 5;
 
-    for (let x = startX; x <= worldRight; x += gs) {
-      for (let y = startY; y <= worldTop; y += gs) {
-        const sp = store.worldToScreen({ x, y });
-        ctx.fillRect(sp.x - dotSize / 2, sp.y - dotSize / 2, dotSize, dotSize);
+    if (!hasUCS) {
+      const startX = Math.floor(worldLeft / gs) * gs;
+      const startY = Math.floor(worldBottom / gs) * gs;
+      for (let x = startX; x <= worldRight; x += gs) {
+        for (let y = startY; y <= worldTop; y += gs) {
+          const isMajor = Math.round(x / gs) % majorEvery === 0 && Math.round(y / gs) % majorEvery === 0;
+          ctx.fillStyle = isMajor ? '#555555' : '#333333';
+          const sz = isMajor ? dotSize * 1.5 : dotSize;
+          const sp = store.worldToScreen({ x, y });
+          ctx.fillRect(sp.x - sz / 2, sp.y - sz / 2, sz, sz);
+        }
+      }
+    } else {
+      const cos = Math.cos(ucsRad), sin = Math.sin(ucsRad);
+      const diag = Math.hypot(worldRight - worldLeft, worldTop - worldBottom);
+      const range = Math.ceil(diag / gs) + 2;
+      const cx = (worldLeft + worldRight) / 2;
+      const cy = (worldBottom + worldTop) / 2;
+      const ucsCenterX = Math.round(((cx - ucsOrig.x) * cos + (cy - ucsOrig.y) * sin) / gs);
+      const ucsCenterY = Math.round((-(cx - ucsOrig.x) * sin + (cy - ucsOrig.y) * cos) / gs);
+
+      for (let i = -range; i <= range; i++) {
+        for (let j = -range; j <= range; j++) {
+          const ui = ucsCenterX + i, uj = ucsCenterY + j;
+          const wx = ucsOrig.x + ui * gs * cos - uj * gs * sin;
+          const wy = ucsOrig.y + ui * gs * sin + uj * gs * cos;
+          if (wx < worldLeft - gs || wx > worldRight + gs || wy < worldBottom - gs || wy > worldTop + gs) continue;
+          const isMajor = ui % majorEvery === 0 && uj % majorEvery === 0;
+          ctx.fillStyle = isMajor ? '#555555' : '#333333';
+          const sz = isMajor ? dotSize * 1.5 : dotSize;
+          const sp = store.worldToScreen({ x: wx, y: wy });
+          ctx.fillRect(sp.x - sz / 2, sp.y - sz / 2, sz, sz);
+        }
       }
     }
   }
@@ -215,23 +275,138 @@ export class Renderer {
 
   private drawUCSIcon() {
     const ctx = this.ctx;
-    const ox = 30, oy = this.canvas.getBoundingClientRect().height - 30;
-    const len = 20;
+    const hasUCS = store.isUCS();
+    const rad = store.ucsAngle * Math.PI / 180;
+    const len = 22;
+    const ox = 35, oy = this.canvas.getBoundingClientRect().height - 35;
 
-    ctx.strokeStyle = '#888888';
-    ctx.lineWidth = 1;
-    ctx.fillStyle = '#888888';
-    ctx.font = '10px monospace';
+    const xColor = hasUCS ? '#ff4444' : '#888888';
+    const yColor = hasUCS ? '#44ff44' : '#888888';
+    const labelColor = hasUCS ? '#ffffff' : '#888888';
+
+    const xDx = Math.cos(rad) * len, xDy = -Math.sin(rad) * len;
+    const yDx = -Math.sin(rad) * len, yDy = -Math.cos(rad) * len;
+
+    ctx.lineWidth = hasUCS ? 2 : 1;
 
     // X axis
+    ctx.strokeStyle = xColor;
     ctx.beginPath();
-    ctx.moveTo(ox, oy); ctx.lineTo(ox + len, oy); ctx.stroke();
-    ctx.fillText('X', ox + len + 2, oy + 4);
+    ctx.moveTo(ox, oy); ctx.lineTo(ox + xDx, oy + xDy); ctx.stroke();
+    // X arrowhead
+    const xTip = { x: ox + xDx, y: oy + xDy };
+    const xAng = Math.atan2(xDy, xDx);
+    ctx.fillStyle = xColor;
+    ctx.beginPath();
+    ctx.moveTo(xTip.x, xTip.y);
+    ctx.lineTo(xTip.x - 6 * Math.cos(xAng - 0.4), xTip.y - 6 * Math.sin(xAng - 0.4));
+    ctx.lineTo(xTip.x - 6 * Math.cos(xAng + 0.4), xTip.y - 6 * Math.sin(xAng + 0.4));
+    ctx.fill();
 
     // Y axis
+    ctx.strokeStyle = yColor;
     ctx.beginPath();
-    ctx.moveTo(ox, oy); ctx.lineTo(ox, oy - len); ctx.stroke();
-    ctx.fillText('Y', ox - 4, oy - len - 4);
+    ctx.moveTo(ox, oy); ctx.lineTo(ox + yDx, oy + yDy); ctx.stroke();
+    // Y arrowhead
+    const yTip = { x: ox + yDx, y: oy + yDy };
+    const yAng = Math.atan2(yDy, yDx);
+    ctx.fillStyle = yColor;
+    ctx.beginPath();
+    ctx.moveTo(yTip.x, yTip.y);
+    ctx.lineTo(yTip.x - 6 * Math.cos(yAng - 0.4), yTip.y - 6 * Math.sin(yAng - 0.4));
+    ctx.lineTo(yTip.x - 6 * Math.cos(yAng + 0.4), yTip.y - 6 * Math.sin(yAng + 0.4));
+    ctx.fill();
+
+    // Axis labels
+    ctx.font = 'bold 10px monospace';
+    ctx.fillStyle = labelColor;
+    ctx.fillText('X', ox + xDx + Math.cos(xAng) * 8, oy + xDy + Math.sin(xAng) * 8 + 3);
+    ctx.fillText('Y', ox + yDx + Math.cos(yAng) * 8, oy + yDy + Math.sin(yAng) * 8 + 3);
+
+    // Origin marker: small square for WCS, small circle for UCS
+    if (hasUCS) {
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(ox, oy, 3, 0, Math.PI * 2);
+      ctx.stroke();
+    } else {
+      ctx.strokeStyle = '#888888';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(ox - 2, oy - 2, 4, 4);
+    }
+
+    // WCS/UCS label
+    ctx.font = '9px monospace';
+    ctx.fillStyle = labelColor;
+    ctx.fillText(hasUCS ? 'UCS' : 'WCS', ox - 6, oy + 14);
+  }
+
+  private drawScaleBar(w: number, h: number) {
+    const ctx = this.ctx;
+    const barMaxPx = 120;
+    const worldLen = barMaxPx / store.view.zoom;
+
+    const niceSteps = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000];
+    let step = niceSteps[0];
+    for (const s of niceSteps) {
+      if (s <= worldLen) step = s;
+      else break;
+    }
+    // Handle very small zoom
+    if (worldLen < 1) {
+      const small = [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5];
+      step = small[0];
+      for (const s of small) {
+        if (s <= worldLen) step = s;
+        else break;
+      }
+    }
+
+    const barPx = step * store.view.zoom;
+    const bx = w - barPx - 20;
+    const by = h - 16;
+
+    ctx.strokeStyle = '#aaaaaa';
+    ctx.fillStyle = '#aaaaaa';
+    ctx.lineWidth = 1;
+
+    // Horizontal bar
+    ctx.beginPath();
+    ctx.moveTo(bx, by); ctx.lineTo(bx + barPx, by); ctx.stroke();
+    // End ticks
+    ctx.beginPath();
+    ctx.moveTo(bx, by - 4); ctx.lineTo(bx, by + 4); ctx.stroke();
+    ctx.beginPath();
+    ctx.moveTo(bx + barPx, by - 4); ctx.lineTo(bx + barPx, by + 4); ctx.stroke();
+
+    // Label
+    let label: string;
+    if (step >= 1) label = step.toString();
+    else label = step.toFixed(3).replace(/0+$/, '').replace(/\.$/, '');
+    ctx.font = '9px monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, bx + barPx / 2, by - 6);
+    ctx.textAlign = 'start';
+  }
+
+  private drawGrips() {
+    if (!store.gripsEnabled) return;
+    const ctx = this.ctx;
+    const gs = 4;
+    for (const e of store.entities) {
+      if (!e.visible || !e.selected) continue;
+      const grips = getGripPoints(e);
+      for (let gi = 0; gi < grips.length; gi++) {
+        const sp = store.worldToScreen(grips[gi]);
+        const isHot = this.hotGrip && this.hotGrip.entityId === e.id && this.hotGrip.gripIndex === gi;
+        ctx.fillStyle = isHot ? '#ff0000' : '#0066ff';
+        ctx.fillRect(sp.x - gs, sp.y - gs, gs * 2 + 1, gs * 2 + 1);
+        ctx.strokeStyle = isHot ? '#ffffff' : '#aaccff';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(sp.x - gs, sp.y - gs, gs * 2 + 1, gs * 2 + 1);
+      }
+    }
   }
 
   private drawSnapMarker(snap: SnapResult) {
@@ -327,23 +502,67 @@ export class Renderer {
     const ctx = this.ctx;
     ctx.strokeStyle = this.resolveColor(e);
     const lw = this.resolveLineweight(e);
-    const screenLw = Math.max(1, lw * store.view.zoom * 0.3);
+    const screenLw = store.lwDisplay ? Math.max(1, lw * 0.3 * store.view.zoom) : 1;
+    ctx.lineWidth = screenLw;
+
     if (e.selected) {
-      ctx.lineWidth = screenLw;
       ctx.setLineDash([6, 3]);
     } else {
-      ctx.lineWidth = screenLw;
-      ctx.setLineDash(LINETYPE_PATTERNS[e.linetype] || []);
+      ctx.setLineDash([]);
     }
 
+    // Hover highlight: brighter color and thicker line
+    if (e.id === store.hoveredEntityId && !e.selected) {
+      ctx.strokeStyle = '#00ffff';
+      ctx.lineWidth = screenLw + 1.5;
+    }
+
+    // World-space dash pattern for non-continuous linetypes
+    const rawPattern = (!e.selected && e.linetype && e.linetype !== 'continuous')
+      ? (LINETYPE_PATTERNS[e.linetype] || [])
+      : [];
+    const worldPattern = rawPattern.map(v => v * store.ltScale);
+    const hasDash = worldPattern.length > 0;
+
     switch (e.type) {
-      case 'line': this.strokeLine(e.start, e.end); break;
-      case 'circle': this.strokeCircle(e.center, e.radius); break;
-      case 'arc': this.strokeArc(e.center, e.radius, e.startAngle, e.endAngle); break;
-      case 'polyline': this.drawPolyline(e); break;
-      case 'rect': this.strokeRectWorld(e.corner1, e.corner2); break;
+      case 'line':
+        if (hasDash) this.strokeDashedPath([e.start, e.end], worldPattern, false);
+        else this.strokeLine(e.start, e.end);
+        break;
+      case 'circle':
+        if (hasDash) this.strokeDashedCircle(e.center, e.radius, worldPattern);
+        else this.strokeCircle(e.center, e.radius);
+        break;
+      case 'arc':
+        if (hasDash) this.strokeDashedArc(e.center, e.radius, e.startAngle, e.endAngle, worldPattern);
+        else this.strokeArc(e.center, e.radius, e.startAngle, e.endAngle);
+        break;
+      case 'polyline':
+        if (hasDash) {
+          ctx.setLineDash([]);
+          this.strokeDashedPolyline(e, rawPattern);
+        } else {
+          this.drawPolyline(e);
+        }
+        break;
+      case 'rect':
+        if (hasDash) {
+          const rectPts: Point[] = [
+            e.corner1,
+            { x: e.corner2.x, y: e.corner1.y },
+            e.corner2,
+            { x: e.corner1.x, y: e.corner2.y },
+          ];
+          this.strokeDashedPath(rectPts, worldPattern, true);
+        } else {
+          this.strokeRectWorld(e.corner1, e.corner2);
+        }
+        break;
+      case 'ellipse':
+        if (hasDash) this.strokeDashedEllipse(e, worldPattern);
+        else this.drawEllipse(e);
+        break;
       case 'text': this.drawText(e); break;
-      case 'ellipse': this.drawEllipse(e); break;
       case 'dimension': this.drawDimension(e); break;
       case 'point': this.drawPoint(e); break;
       case 'hatch': this.drawHatch(e); break;
@@ -379,18 +598,234 @@ export class Renderer {
     this.ctx.strokeRect(s1.x, s1.y, s2.x - s1.x, s2.y - s1.y);
   }
 
-  private drawPolyline(e: { points: Point[]; closed: boolean }) {
+  private strokeDashedPath(worldPoints: Point[], pattern: number[], closed: boolean) {
+    const ctx = this.ctx;
+    const zoom = store.view.zoom;
+    const totalPatLen = pattern.reduce((a, b) => a + b, 0);
+
+    if (totalPatLen === 0 || pattern.length === 0 || worldPoints.length < 2) {
+      if (worldPoints.length < 2) return;
+      ctx.beginPath();
+      const s0 = store.worldToScreen(worldPoints[0]);
+      ctx.moveTo(s0.x, s0.y);
+      for (let i = 1; i < worldPoints.length; i++) {
+        const sp = store.worldToScreen(worldPoints[i]);
+        ctx.lineTo(sp.x, sp.y);
+      }
+      if (closed) ctx.closePath();
+      ctx.stroke();
+      return;
+    }
+
+    const screenPattern = pattern.map(v => v * zoom);
+    const pts = worldPoints.map(p => store.worldToScreen(p));
+    if (closed && pts.length > 0) {
+      pts.push({ x: pts[0].x, y: pts[0].y });
+    }
+
+    let patIdx = 0;
+    let patRemain = screenPattern[0];
+    let drawing = true;
+
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      let sx = pts[i].x, sy = pts[i].y;
+      const ex = pts[i + 1].x, ey = pts[i + 1].y;
+      let segLen = Math.hypot(ex - sx, ey - sy);
+      if (segLen < 0.5) continue;
+      const ux = (ex - sx) / segLen, uy = (ey - sy) / segLen;
+
+      while (segLen > 0.001) {
+        if (patRemain >= segLen) {
+          if (drawing) ctx.lineTo(ex, ey);
+          else ctx.moveTo(ex, ey);
+          patRemain -= segLen;
+          segLen = 0;
+        } else {
+          const nx = sx + ux * patRemain;
+          const ny = sy + uy * patRemain;
+          if (drawing) ctx.lineTo(nx, ny);
+          else ctx.moveTo(nx, ny);
+          sx = nx; sy = ny;
+          segLen -= patRemain;
+          patIdx = (patIdx + 1) % screenPattern.length;
+          patRemain = screenPattern[patIdx];
+          drawing = !drawing;
+        }
+      }
+
+      if (patRemain < 0.001) {
+        patIdx = (patIdx + 1) % screenPattern.length;
+        patRemain = screenPattern[patIdx];
+        drawing = !drawing;
+      }
+    }
+    ctx.stroke();
+  }
+
+  private strokeDashedCircle(center: Point, radius: number, pattern: number[]) {
+    const numSegments = Math.min(360, Math.max(72, Math.ceil(radius * store.view.zoom * 0.5)));
+    const points: Point[] = [];
+    for (let i = 0; i < numSegments; i++) {
+      const a = (i / numSegments) * Math.PI * 2;
+      points.push({ x: center.x + radius * Math.cos(a), y: center.y + radius * Math.sin(a) });
+    }
+    this.strokeDashedPath(points, pattern, true);
+  }
+
+  private strokeDashedArc(center: Point, radius: number, startAngle: number, endAngle: number, pattern: number[]) {
+    let sweep = endAngle - startAngle;
+    if (sweep <= 0) sweep += Math.PI * 2;
+    const numSegments = Math.min(360, Math.max(36, Math.ceil(sweep * radius * store.view.zoom * 0.25)));
+    const points: Point[] = [];
+    for (let i = 0; i <= numSegments; i++) {
+      const a = startAngle + (i / numSegments) * sweep;
+      points.push({ x: center.x + radius * Math.cos(a), y: center.y + radius * Math.sin(a) });
+    }
+    this.strokeDashedPath(points, pattern, false);
+  }
+
+  private strokeDashedEllipse(e: { center: Point; majorX: number; majorY: number; ratio: number; startParam: number; endParam: number }, pattern: number[]) {
+    const majorLen = Math.hypot(e.majorX, e.majorY);
+    const rot = Math.atan2(e.majorY, e.majorX);
+    let sweep = e.endParam - e.startParam;
+    if (sweep <= 0) sweep += Math.PI * 2;
+    const isFull = Math.abs(sweep - Math.PI * 2) < 0.001;
+    const numSegments = Math.min(360, Math.max(72, Math.ceil(majorLen * store.view.zoom * 0.5)));
+    const points: Point[] = [];
+    const count = isFull ? numSegments : numSegments + 1;
+    for (let i = 0; i < count; i++) {
+      const t = e.startParam + (i / numSegments) * sweep;
+      const lx = majorLen * Math.cos(t);
+      const ly = majorLen * e.ratio * Math.sin(t);
+      points.push({
+        x: e.center.x + lx * Math.cos(rot) - ly * Math.sin(rot),
+        y: e.center.y + lx * Math.sin(rot) + ly * Math.cos(rot),
+      });
+    }
+    this.strokeDashedPath(points, pattern, isFull);
+  }
+
+  private drawPolyline(e: { points: Point[]; closed: boolean; bulges?: number[] }) {
     if (e.points.length < 2) return;
     const ctx = this.ctx;
     ctx.beginPath();
     const s0 = store.worldToScreen(e.points[0]);
     ctx.moveTo(s0.x, s0.y);
-    for (let i = 1; i < e.points.length; i++) {
-      const sp = store.worldToScreen(e.points[i]);
-      ctx.lineTo(sp.x, sp.y);
+
+    const n = e.points.length;
+    const segCount = e.closed ? n : n - 1;
+
+    for (let i = 0; i < segCount; i++) {
+      const j = (i + 1) % n;
+      const bg = e.bulges?.[i] ?? 0;
+
+      if (Math.abs(bg) > 1e-10) {
+        const arc = bulgeArc(e.points[i], e.points[j], bg);
+        const sc = store.worldToScreen(arc.center);
+        const sr = arc.radius * store.view.zoom;
+        ctx.arc(sc.x, sc.y, sr, -arc.startAngle, -arc.endAngle, !arc.ccw);
+      } else {
+        const sp = store.worldToScreen(e.points[j]);
+        ctx.lineTo(sp.x, sp.y);
+      }
     }
-    if (e.closed) ctx.closePath();
+
     ctx.stroke();
+  }
+
+  private strokeDashedPolyline(e: PolylineEntity, pattern: number[]): void {
+    if (e.points.length < 2) return;
+    const ctx = this.ctx;
+
+    const path: { x: number; y: number }[] = [];
+    path.push(store.worldToScreen(e.points[0]));
+
+    const segCount = e.closed ? e.points.length : e.points.length - 1;
+
+    for (let i = 0; i < segCount; i++) {
+      const p1 = e.points[i];
+      const p2 = e.points[(i + 1) % e.points.length];
+      const bulge = e.bulges?.[i] ?? 0;
+
+      if (Math.abs(bulge) < 1e-10) {
+        path.push(store.worldToScreen(p2));
+      } else {
+        const arc = bulgeArc(p1, p2, bulge);
+        const screenRadius = arc.radius * store.view.zoom;
+
+        let sweep = arc.endAngle - arc.startAngle;
+        if (arc.ccw) {
+          if (sweep <= 0) sweep += Math.PI * 2;
+        } else {
+          if (sweep >= 0) sweep -= Math.PI * 2;
+        }
+
+        const arcLen = Math.abs(sweep) * screenRadius;
+        const steps = Math.max(8, Math.ceil(arcLen / 3));
+        const sc = store.worldToScreen(arc.center);
+
+        for (let t = 1; t <= steps; t++) {
+          const frac = t / steps;
+          const a = arc.startAngle + sweep * frac;
+          path.push({
+            x: sc.x + screenRadius * Math.cos(a),
+            y: sc.y - screenRadius * Math.sin(a),
+          });
+        }
+      }
+    }
+
+    let patIdx = 0;
+    let patRemain = pattern[0];
+    let isDash = true;
+    let inDash = false;
+
+    for (let i = 1; i < path.length; i++) {
+      const px = path[i - 1].x, py = path[i - 1].y;
+      const qx = path[i].x, qy = path[i].y;
+      const dx = qx - px, dy = qy - py;
+      const segLen = Math.hypot(dx, dy);
+      if (segLen < 0.01) continue;
+
+      let pos = 0;
+      while (pos < segLen - 0.001) {
+        const step = Math.min(patRemain, segLen - pos);
+        if (step < 0.001) break;
+        const f1 = pos / segLen;
+        const f2 = (pos + step) / segLen;
+
+        if (isDash) {
+          if (!inDash) {
+            ctx.beginPath();
+            ctx.moveTo(px + dx * f1, py + dy * f1);
+            inDash = true;
+          }
+          ctx.lineTo(px + dx * f2, py + dy * f2);
+        } else if (inDash) {
+          ctx.stroke();
+          inDash = false;
+        }
+
+        pos += step;
+        patRemain -= step;
+        if (patRemain < 0.01) {
+          if (isDash && inDash) {
+            ctx.stroke();
+            inDash = false;
+          }
+          patIdx = (patIdx + 1) % pattern.length;
+          patRemain = pattern[patIdx];
+          isDash = !isDash;
+        }
+      }
+    }
+
+    if (inDash) {
+      ctx.stroke();
+    }
   }
 
   private drawText(e: { position: Point; text: string; height: number; rotation: number; color?: string; textStyle?: string }) {
@@ -674,7 +1109,8 @@ export class Renderer {
       const sa = Math.atan2(s2.y - s1.y, s2.x - s1.x);
       this.drawArrowhead(s1, sa, arrowLen);
       this.drawArrowhead(s2, sa + Math.PI, arrowLen);
-      this.drawDimText(e.textOverride || '', { x: (dimP1.x + dimP2.x) / 2, y: (dimP1.y + dimP2.y) / 2 });
+      const linearDist = Math.hypot(dimP2.x - dimP1.x, dimP2.y - dimP1.y);
+      this.drawDimText(e.textOverride || linearDist.toFixed(ds.precision), { x: (dimP1.x + dimP2.x) / 2, y: (dimP1.y + dimP2.y) / 2 });
     } else if (e.dimType === 'aligned') {
       const dx = e.p2.x - e.p1.x, dy = e.p2.y - e.p1.y;
       const len = Math.hypot(dx, dy);
@@ -711,7 +1147,13 @@ export class Renderer {
       this.drawExtLine(center, e.p2, extGap);
       const midAng = (a1 + a2) / 2;
       const textWorld = polarPoint(center, radius, midAng);
-      this.drawDimText(e.textOverride || '', textWorld);
+      let angularText = e.textOverride;
+      if (!angularText) {
+        let sweep = a2 - a1;
+        if (sweep < 0) sweep += 2 * Math.PI;
+        angularText = (sweep * 180 / Math.PI).toFixed(ds.precision) + '°';
+      }
+      this.drawDimText(angularText, textWorld);
     } else {
       this.strokeLine(e.p1, e.p2);
       const s1 = store.worldToScreen(e.p1), s2 = store.worldToScreen(e.p2);
@@ -722,7 +1164,18 @@ export class Renderer {
         this.drawArrowhead(s1, sa + Math.PI, arrowLen);
         this.drawArrowhead(s2, sa, arrowLen);
       }
-      this.drawDimText(e.textOverride || '', e.textPos);
+      let fallbackText = e.textOverride;
+      if (!fallbackText) {
+        const d = dist(e.p1, e.p2);
+        if (e.dimType === 'radius') {
+          fallbackText = 'R' + d.toFixed(ds.precision);
+        } else if (e.dimType === 'diameter') {
+          fallbackText = '⌀' + d.toFixed(ds.precision);
+        } else {
+          fallbackText = d.toFixed(ds.precision);
+        }
+      }
+      this.drawDimText(fallbackText, e.textPos);
     }
   }
 
@@ -738,6 +1191,7 @@ export class Renderer {
   }
 
   private drawDimText(text: string, worldPos: Point) {
+    if (!text) return;
     const ds = store.currentDimStyle;
     const sp = store.worldToScreen(worldPos);
     const fontSize = Math.max(8, ds.textHeight * store.view.zoom);

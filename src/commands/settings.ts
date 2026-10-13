@@ -2,6 +2,7 @@ import { SnapMode } from '../types';
 import { store } from '../store';
 import { pointOnEntity } from '../geometry';
 import { CommandEngine } from './engine';
+import { startShelterMode } from '../shelter';
 
 export function registerSettingsCommands(engine: CommandEngine) {
 
@@ -31,7 +32,33 @@ export function registerSettingsCommands(engine: CommandEngine) {
 
   engine.register('ORTHO', ['F8', 'OR'], () => {
     store.orthoOn = !store.orthoOn;
+    if (store.orthoOn) store.polarTrackingOn = false;
     engine.prompt(`ORTHO ${store.orthoOn ? 'on' : 'off'}`);
+    engine.complete();
+  });
+
+  engine.register('POLARANG', [], () => {
+    engine.prompt(`POLARANG Current polar tracking angle: ${store.polarTrackingAngle}°`);
+    engine.prompt('Enter increment angle [90/45/30/15/10/5] or custom:');
+    engine.waitForInput('Angle:', (input) => {
+      if (input === '') { engine.complete(); return true; }
+      const val = parseFloat(input);
+      if (isNaN(val) || val <= 0 || val > 360) {
+        engine.prompt('Invalid angle. Must be between 0 and 360.');
+        engine.complete();
+        return true;
+      }
+      store.polarTrackingAngle = val;
+      engine.prompt(`Polar tracking angle set to ${val}°`);
+      engine.complete();
+      return true;
+    });
+  });
+
+  engine.register('POLARMODE', [], () => {
+    store.polarTrackingOn = !store.polarTrackingOn;
+    if (store.polarTrackingOn) store.orthoOn = false;
+    engine.prompt(`Polar Tracking ${store.polarTrackingOn ? 'ON' : 'OFF'} (${store.polarTrackingAngle}°)`);
     engine.complete();
   });
 
@@ -95,6 +122,7 @@ export function registerSettingsCommands(engine: CommandEngine) {
             l.current ? 'Current' : '',
             l.visible ? 'On' : 'Off',
             l.locked ? 'Locked' : '',
+            l.plot === false ? 'No-plot' : '',
           ].filter(Boolean).join(', ');
           engine.prompt(`  "${l.name}" Color: ${l.color} [${flags}]`);
         }
@@ -108,7 +136,7 @@ export function registerSettingsCommands(engine: CommandEngine) {
           if (store.layers.find(l => l.name === name)) {
             engine.prompt(`Layer "${name}" already exists`);
           } else {
-            store.layers.push({ name, color: '#ffffff', visible: true, locked: false, frozen: false, current: false, lineweight: 1 });
+            store.layers.push({ name, color: '#ffffff', visible: true, locked: false, frozen: false, current: false, lineweight: 1, plot: true });
             engine.prompt(`Layer "${name}" created`);
           }
           engine.complete();
@@ -263,6 +291,14 @@ export function registerSettingsCommands(engine: CommandEngine) {
       engine.complete();
       return true;
     };
+  });
+
+  // === LWDISPLAY (LWT) — lineweight display toggle ===
+  engine.register('LWDISPLAY', ['LWT'], () => {
+    store.lwDisplay = !store.lwDisplay;
+    engine.prompt(`Lineweight display: ${store.lwDisplay ? 'ON' : 'OFF'}`);
+    store.emit();
+    engine.complete();
   });
 
   // === MATCHPROP (MA) ===
@@ -944,7 +980,15 @@ export function registerSettingsCommands(engine: CommandEngine) {
       },
       ORTHOMODE: {
         get: () => store.orthoOn ? '1' : '0',
-        set: (v) => { store.orthoOn = v === '1'; },
+        set: (v) => { store.orthoOn = v === '1'; if (store.orthoOn) store.polarTrackingOn = false; },
+      },
+      POLARMODE: {
+        get: () => store.polarTrackingOn ? '1' : '0',
+        set: (v) => { store.polarTrackingOn = v === '1'; if (store.polarTrackingOn) store.orthoOn = false; },
+      },
+      POLARANG: {
+        get: () => String(store.polarTrackingAngle),
+        set: (v) => { const n = parseFloat(v); if (!isNaN(n) && n > 0 && n <= 360) store.polarTrackingAngle = n; },
       },
       GRIDMODE: {
         get: () => store.gridOn ? '1' : '0',
@@ -1037,7 +1081,7 @@ export function registerSettingsCommands(engine: CommandEngine) {
     engine.prompt(`  Named views: ${store.namedViews.size}`);
     const lim = store.drawingLimits;
     engine.prompt(`  Limits: (${lim.min.x}, ${lim.min.y}) to (${lim.max.x}, ${lim.max.y})  Checking: ${store.limitsOn ? 'ON' : 'OFF'}`);
-    engine.prompt(`  Grid: ${store.gridOn ? 'ON' : 'OFF'} (${store.gridSpacing})  Snap: ${store.snapToGrid ? 'ON' : 'OFF'}  Ortho: ${store.orthoOn ? 'ON' : 'OFF'}`);
+    engine.prompt(`  Grid: ${store.gridOn ? 'ON' : 'OFF'} (${store.gridSpacing})  Snap: ${store.snapToGrid ? 'ON' : 'OFF'}  Ortho: ${store.orthoOn ? 'ON' : 'OFF'}  Polar: ${store.polarTrackingOn ? 'ON' : 'OFF'} (${store.polarTrackingAngle}°)`);
     engine.prompt(`  Zoom: ${store.view.zoom.toFixed(3)}  Pan: (${store.view.panX.toFixed(1)}, ${store.view.panY.toFixed(1)})`);
     engine.prompt(`  Session time: ${mins}m ${secs}s`);
     engine.complete();
@@ -1272,7 +1316,7 @@ export function registerSettingsCommands(engine: CommandEngine) {
       for (const l of store.layers) l.current = false;
       let found = store.layers.find(l => l.name === targetName);
       if (!found) {
-        found = { name: targetName, color: '#ffffff', visible: true, locked: false, frozen: false, current: true, lineweight: 1 };
+        found = { name: targetName, color: '#ffffff', visible: true, locked: false, frozen: false, current: true, lineweight: 1, plot: true };
         store.layers.push(found);
       }
       found.current = true;
@@ -1991,8 +2035,9 @@ export function registerSettingsCommands(engine: CommandEngine) {
     engine.prompt(`Grid: ${store.gridOn ? 'ON' : 'OFF'}, Spacing: ${store.gridSpacing}`);
     engine.prompt(`Snap: ${store.snapToGrid ? 'ON' : 'OFF'}`);
     engine.prompt(`Ortho: ${store.orthoOn ? 'ON' : 'OFF'}`);
+    engine.prompt(`Polar Tracking: ${store.polarTrackingOn ? 'ON' : 'OFF'}, Angle: ${store.polarTrackingAngle}°`);
     engine.prompt(`OSNAP: ${store.snapModes.size > 0 ? Array.from(store.snapModes).join(', ') : 'OFF'}`);
-    engine.prompt('Set [Grid/Snap/Ortho/Osnap]:');
+    engine.prompt('Set [Grid/Snap/Ortho/Polar/Osnap]:');
     engine.inputHandler = (input) => {
       if (input === '') { engine.complete(); return true; }
       const opt = input.toLowerCase();
@@ -2017,7 +2062,14 @@ export function registerSettingsCommands(engine: CommandEngine) {
         return true;
       } else if (opt === 'o' || opt === 'ortho') {
         store.orthoOn = !store.orthoOn;
+        if (store.orthoOn) store.polarTrackingOn = false;
         engine.prompt(`Ortho ${store.orthoOn ? 'ON' : 'OFF'}`);
+        engine.complete();
+        return true;
+      } else if (opt === 'p' || opt === 'polar') {
+        store.polarTrackingOn = !store.polarTrackingOn;
+        if (store.polarTrackingOn) store.orthoOn = false;
+        engine.prompt(`Polar Tracking ${store.polarTrackingOn ? 'ON' : 'OFF'} (${store.polarTrackingAngle}°)`);
         engine.complete();
         return true;
       } else if (opt === 'os' || opt === 'osnap') {
@@ -2045,26 +2097,35 @@ export function registerSettingsCommands(engine: CommandEngine) {
         });
         return true;
       }
-      engine.prompt('Invalid. [Grid/Snap/Ortho/Osnap]:');
+      engine.prompt('Invalid. [Grid/Snap/Ortho/Polar/Osnap]:');
       return true;
     };
   });
 
+  // === GRIPS ===
+  engine.register('GRIPS', [], () => {
+    store.gripsEnabled = !store.gripsEnabled;
+    store.emit();
+    engine.prompt(`Grips: ${store.gripsEnabled ? 'ON' : 'OFF'}`);
+    engine.complete();
+  });
+
   // === DDGRIPS ===
   engine.register('DDGRIPS', [], () => {
-    const gripsOn = (store as any).gripsEnabled !== false;
-    engine.prompt(`DDGRIPS Grips: ${gripsOn ? 'ON' : 'OFF'}`);
+    engine.prompt(`DDGRIPS Grips: ${store.gripsEnabled ? 'ON' : 'OFF'}`);
     engine.prompt('Toggle grips [On/Off]:');
     engine.inputHandler = (input) => {
       if (input === '') { engine.complete(); return true; }
       const opt = input.toLowerCase();
       if (opt === 'on' || opt === '1') {
-        (store as any).gripsEnabled = true;
+        store.gripsEnabled = true;
+        store.emit();
         engine.prompt('Grips enabled');
         engine.complete();
         return true;
       } else if (opt === 'off' || opt === '0') {
-        (store as any).gripsEnabled = false;
+        store.gripsEnabled = false;
+        store.emit();
         engine.prompt('Grips disabled');
         engine.complete();
         return true;
@@ -2316,6 +2377,44 @@ export function registerSettingsCommands(engine: CommandEngine) {
     });
   });
 
+  // === LAYERPLOT (LPLOT) ===
+  engine.register('LAYERPLOT', ['LPLOT'], () => {
+    engine.prompt(`LAYERPLOT Enter layer name to toggle plot status:`);
+    engine.prompt(`Layers: ${store.layers.map(l => `${l.name}${l.plot === false ? ' (no-plot)' : ''}`).join(', ')}`);
+    engine.waitForInput('Layer:', (input) => {
+      const name = input.trim();
+      if (!name) { engine.complete(); return true; }
+      const layer = store.layers.find(l => l.name.toLowerCase() === name.toLowerCase());
+      if (!layer) {
+        engine.prompt(`Layer "${name}" not found`);
+        engine.complete();
+        return true;
+      }
+      layer.plot = !(layer.plot !== false);
+      store.emit();
+      engine.prompt(`Layer "${layer.name}" plot: ${layer.plot ? 'ON' : 'OFF (construction)'}`);
+      engine.complete();
+      return true;
+    });
+  });
+
+  // === CONSTRUCTION (CONST) ===
+  engine.register('CONSTRUCTION', ['CONST'], () => {
+    let conLayer = store.layers.find(l => l.name === 'CONSTRUCTION');
+    if (!conLayer) {
+      store.layers.push({
+        name: 'CONSTRUCTION', color: '#808080', visible: true,
+        locked: false, frozen: false, current: false, lineweight: 1, plot: false,
+      });
+      conLayer = store.layers[store.layers.length - 1];
+    }
+    for (const l of store.layers) l.current = false;
+    conLayer.current = true;
+    store.emit();
+    engine.prompt('Current layer set to CONSTRUCTION (non-plottable)');
+    engine.complete();
+  });
+
   // === PAGESETUP ===
   engine.register('PAGESETUP', [], () => {
     const ps = (store as any).pageSetup || { paperSize: 'A3', orientation: 'landscape', scale: '1:1' };
@@ -2359,6 +2458,16 @@ export function registerSettingsCommands(engine: CommandEngine) {
       engine.prompt('Invalid. [Paper/Orientation/Scale]:');
       return true;
     };
+  });
+
+  // SHELTER — place a 쉼터 rectangle and enter placement loop
+  engine.register('SHELTER', ['SHL'], () => {
+    engine.prompt('SHELTER — 쉼터 건물배치도');
+    engine.prompt('Click to set shelter position:');
+    engine.waitForClick((pt) => {
+      engine.complete();
+      startShelterMode(pt, engine.promptFn);
+    });
   });
 
 }

@@ -4,6 +4,8 @@ import { store } from './store';
 import { findSnap } from './snap';
 import { entityBounds, pointOnEntity as pointOnEntityCheck, getGripPoints, moveGrip, dist } from './geometry';
 import { Point, Entity } from './types';
+import { openCadastralDialog } from './cadastral';
+import { shelterState, handleShelterKey, handleShelterClick, handleShelterMove } from './shelter';
 
 const canvas = document.getElementById('cad-canvas') as HTMLCanvasElement;
 const cmdInput = document.getElementById('cmd-input') as HTMLInputElement;
@@ -160,6 +162,8 @@ canvas.addEventListener('mousemove', (e) => {
     store.hoveredEntityId = null;
   }
 
+  handleShelterMove(snap.point);
+
   engine.handleMove(snap.point);
 });
 
@@ -184,6 +188,13 @@ canvas.addEventListener('mousedown', (e) => {
     store.hoveredEntityId = null;
     const snap = renderer.snapResult;
     const pt = snap ? snap.point : renderer.cursorWorld;
+
+    // Shelter mode click handling
+    if (shelterState.active) {
+      handleShelterClick(pt, promptFn);
+      cmdInput.focus();
+      return;
+    }
 
     // If grip edit is active, place the grip at new position
     if (gripEdit) {
@@ -383,6 +394,13 @@ function submitCommand() {
 }
 
 cmdInput.addEventListener('keydown', (e) => {
+  if (shelterState.active) {
+    if (handleShelterKey(e.key, promptFn)) {
+      e.preventDefault();
+      cmdInput.value = '';
+      return;
+    }
+  }
   if (e.key === 'ArrowUp') {
     e.preventDefault();
     if (cmdHistoryList.length === 0) return;
@@ -432,6 +450,14 @@ cmdInput.addEventListener('keydown', (e) => {
 
 // Global keyboard — always focus command line when typing
 document.addEventListener('keydown', (e) => {
+  // Shelter mode intercepts all relevant keys
+  if (shelterState.active && document.activeElement !== cmdInput) {
+    if (handleShelterKey(e.key, promptFn)) {
+      e.preventDefault();
+      return;
+    }
+  }
+
   // Delete key — erase selected entities (works from anywhere)
   if (e.key === 'Delete' && !engine.isActive) {
     const sel = store.selectedEntities();
@@ -857,6 +883,7 @@ async function cloudOpen() {
 (window as any).dxfSave = dxfSave;
 (window as any).__store = store;
 (window as any).__engine = engine;
+(window as any).__shelterState = shelterState;
 (window as any).__findSnap = findSnap;
 
 // === FUNCTION KEY HELPERS ===
@@ -1013,6 +1040,7 @@ function handleMenuAction(action: string) {
     case 'f7': engine.handleInput('GRID'); break;
     case 'f8': engine.handleInput('ORTHO'); break;
     case 'f9': toggleGridSnap(); break;
+    case 'cadastral': openCadastralDialog(promptFn); break;
   }
 }
 
