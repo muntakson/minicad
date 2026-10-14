@@ -524,6 +524,16 @@ document.addEventListener('keydown', (e) => {
     }
   }
 
+  // Don't intercept if focused on a dialog input (e.g. cadastral address field)
+  const ae = document.activeElement;
+  if (ae && ae !== cmdInput && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.tagName === 'SELECT')) {
+    if (e.key === 'Escape') {
+      const overlay = document.getElementById('cloud-overlay');
+      if (overlay?.classList.contains('open')) { overlay.classList.remove('open'); }
+    }
+    return;
+  }
+
   // Don't intercept if already focused on input
   if (document.activeElement === cmdInput) {
     if (e.key === 'F1') { e.preventDefault(); showHelp(); return; }
